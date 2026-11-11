@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mega-transcribe-offline"
-version = "0.1.0"
-description = "Offline Arabic audio transcription and local coding assistant for Horus/Debian."
+version = "0.2.0"
+description = "Offline Arabic audio transcription and local coding assistant for Termux."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -17,6 +17,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 mega-transcribe = "mega_transcribe.cli:main"
+mega-transcribe-web = "mega_transcribe.web_app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

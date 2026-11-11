@@ -1,95 +1,96 @@
-# Mega Transcribe Offline
+# Mega Transcribe Offline — Termux
 
-نظام طرفية محلي لمعالجة الصوت ومراجعة الشيفرات في Horus/Debian. يهدف إلى العمل بالنماذج المحلية فقط، ولا يرفع الملفات إلى خدمة سحابية أو ينزّل النماذج تلقائيًا.
+واجهة محلية خفيفة لتشغيل تفريغ NeMo، وتحويل الصوت بـFFmpeg، ومساعد Qwen GGUF اختياري. ابدأ من Termux على Android ARM64. لا يمكن ضمان الدقة الحرفية أو استرجاع معلومات فُقدت في ترميز AMR/MP3؛ المعالجة لا تولّد الترددات/الحروف المفقودة ولا تغيّر الملف الأصلي.
 
-## النماذج المستهدفة بحسب الصور
+## الواقع التقني للنماذج الظاهرة
 
-- `asr-egyptian-nemo-v2.0.nemo`: نموذج ASR بصيغة NeMo، وهو مسار التفريغ الأساسي في هذا المشروع.
-- `vad/silero_vad.onnx`: ملف VAD. يُكتشف ويُفحص؛ لا يُشغّل في خط التفريغ تلقائيًا لأن تهيئة Silero ONNX (حالة النموذج/حجم الإطار/معدل العينة) يجب أن تطابق نسخة الملف تحديدًا.
-- `MossFormer2-SE-6bit/model.safetensors`: أوزان تنقية صوت. لا تُطبّق تلقائيًا؛ يلزم كود البنية وإعداداتها المطابقان للأوزان، ولا تكفي `safetensors` وحدها لاستنتاج ذلك بأمان.
-- `asr_egyptian_ctc`, `pyannote`, `deepfilter`: تُعرض في تقرير التشخيص؛ لا يُفترض تنسيقها أو واجهة تشغيلها من اسم المجلد فقط.
-- `qwen2.5-coder-0.5b-instruct-q4_k_m.gguf`: مساعد محلي اختياري لشرح الشيفرة واقتراح التصحيح. منفصل عن ASR ولا يشغّل الأوامر ولا يعدّل الملفات.
+- `asr-egyptian-nemo-v2.0.nemo`: Backend التفريغ المستهدف. يحتاج NeMo Toolkit وPyTorch، لكن تثبيتهما ليس مضمونًا على Termux/Python/ARM64، وغالبًا يتطلب مساحة كبيرة. اختبر التوافق قبل المحاولة.
+- `vad/silero_vad.onnx`، وملفات `asr_egyptian_ctc` وPyannote، و`MossFormer2-SE-6bit/model.safetensors` و`deepfilter`: تُفهرس في الواجهة فقط. لم تُفعّل كـVAD/فصل/تنقية تلقائية لأن الصور لا تحدد إصدارات runtime أو إعدادات النموذج والبنية البرمجية المطابقة. تحميل الأوزان وحده ليس تنفيذًا صالحًا، ولا يضبط هذا الإصدار نسبها أو أوزانها.
+- Qwen: ملف GGUF ليس واضحًا في الصور. المساعد يعمل فقط عند وجود ملف `.gguf` فعلي وبناء llama.cpp المتوافق.
+- SRT: تُستخدم طوابع word-level إن أعادها نموذج NeMo؛ وإلا ينشأ cue واحد بطول التسجيل ويُذكر صراحةً في JSON أن التوقيت تقريبي. لا تُختلق محاذاة كلمة-بكلمة.
 
-## متطلبات مهمة قبل التثبيت
+## تثبيت الأساس في Termux
 
-صور الجهاز تُظهر Android ARM64، وHorus يشغّل Debian، مع Python 3.13.5، ونحو 505 MB ذاكرة متاحة وقرابة 973 MB مساحة حرة وفق المخرجات السابقة. حزمة NeMo/PyTorch كبيرة وتوافقها مع Python 3.13 وARM64 غير مضمون؛ قد لا تكفي المساحة أو الذاكرة لتثبيتها أو تشغيل نموذج 438 MB. لا يمكن ضمان التشغيل دون اختبار على الجهاز. استخدم بيئة Python 3.10–3.12 متوافقة إن كانت متاحة، وتحقق من المساحة قبل تثبيت الاعتماديات. لا تنفذ تثبيت NeMo على البيئة الحالية قبل توفير مساحة كافية.
-
-## إعداد المشروع في Horus
+ثبّت Termux من مصدر رسمي موثوق، وافتح التطبيق نفسه لا Debian/Horus. امنح صلاحية الوصول للملفات من Android، ثم:
 
 ```bash
-cd /workspace/projects
-mkdir -p mega-transcribe-offline
-cd mega-transcribe-offline
+termux-setup-storage
+pkg update -y
+pkg install -y git python ffmpeg
 ```
 
-انسخ/استنسخ ملفات هذا المستودع إلى المجلد، ثم أنشئ بيئة المشروع. لا تخلطها مع `venv` العام الموجود في `/workspace/projects`.
+انسخ المشروع إلى مساحة Termux (مثل `$HOME/mega-transcribe-offline`) أو استنسخه:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+git clone https://github.com/mohamedsaid8820088-getup/Mega-transcript-eg-.git "$HOME/mega-transcribe-offline"
+cd "$HOME/mega-transcribe-offline"
+bash setup-termux.sh
 ```
 
-المسار المقترح للن��اذج هو `models/AudioModels/` داخل مجلد المشروع. إذا كان Horus لا يرى مجلد Android Download، انسخ المجلد من مدير الملفات أو عبر ميزة مشاركة/استيراد الملفات في Horus؛ Shizuku وحده لا يضمن ربط تخزين Android ببيئة Debian.
+سكريبت الإعداد يثبت Python وFFmpeg وGit فقط؛ لا يثبت NeMo/PyTorch أو Qwen binding تلقائيًا حتى لا يملأ التخزين أو يوحي بتوافق غير مؤكد. اعرف المساحة أولًا بـ`df -h "$HOME"`.
+
+## إتاحة النماذج
+
+بعد `termux-setup-storage` قد يظهر Download عبر:
 
 ```text
-models/AudioModels/
-├── asr-egyptian-nemo-v2.0/asr-egyptian-nemo-v2.0.nemo
-├── vad/silero_vad.onnx
-├── MossFormer2-SE-6bit/model.safetensors
-└── ...
-models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf   # إن كان متوفرًا
+$HOME/storage/shared/Download/AudioModels
 ```
 
-أو عيّن المسارات دون نقل الملفات:
+تحقق:
 
 ```bash
-export MEGA_MODELS_DIR="/المسار/الذي-يستطيع-Horus-قراءته/AudioModels"
-export MEGA_NEMO_MODEL="$MEGA_MODELS_DIR/asr-egyptian-nemo-v2.0/asr-egyptian-nemo-v2.0.nemo"
-export MEGA_QWEN_MODEL="/مسار/ملف/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+ls -lah "$HOME/storage/shared/Download/AudioModels"
+find "$HOME/storage/shared/Download/AudioModels" -maxdepth 4 -type f -print
 ```
 
-## التشخيص
+إذا لم ينجح المسار، انسخ المجلد من مدير الملفات إلى مساحة Termux الخاصة. يوصى بنسخ نموذج ASR الضروري فقط توفيرًا للمساحة، ولا تنسخ/ترفع ملفات النماذج إلى GitHub.
+
+اضبط المسارات (عدّلها إلى المسارات الموجودة فعلًا):
+
+```bash
+export MEGA_MODELS_DIR="$HOME/storage/shared/Download/AudioModels"
+export MEGA_NEMO_MODEL="$MEGA_MODELS_DIR/asr-egyptian-nemo-v2.0/asr-egyptian-nemo-v2.0.nemo"
+export MEGA_QWEN_MODEL="$HOME/storage/shared/Download/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
+```
+
+يمكن حفظ هذه الأسطر في `~/.bashrc` بعد التأكد من المسارات. لا تضع نماذج أو مسارات غير موجودة في إعداد ثابت.
+
+## التحقق وتشغيل الواجهة
 
 ```bash
 mega-transcribe doctor
-mega-transcribe doctor --models-dir models/AudioModels
+mega-transcribe-web --host 127.0.0.1 --port 8765
 ```
 
-يعرض التشخيص المسارات، الاعتماديات الاختيارية، إصدار Python، الذاكرة والمساحة إن أمكن. غياب نموذج عن التشخيص يعني أن المسار غير قابل للقرا��ة من Debian؛ لا يحاول البرنامج البحث في Android أو استخراج ZIP تلقائيًا.
+افتح في متصفح Android: `http://127.0.0.1:8765`. اربط الخادم بـ`127.0.0.1` فقط؛ لا تستخدم `0.0.0.0` على شبكة عامة. ارفع ملف الصوت من الواجهة، مثل AMR/3GP/MP3/WAV. الحد الأقصى للرفع 200 MiB. لإيقاف الخادم: Ctrl+C.
 
-## تثبيت محرك NeMo (اختياري وكبير)
+التحويل المؤقت للأصوات إلى mono/16 kHz/PCM S16LE يهدف لقبول مدخلات ASR. يحتفظ التطبيق بالملف الأصلي، ولا يطبّق تطبيعًا أو إزالة ضوضاء افتراضية، لأن ذلك قد يغيّر التسجيل. فك ترميز صيغة مضغوطة لا يعيد عينات/ترددات حذفها الترميز.
 
-التفريغ يتطلب `nemo_toolkit[asr]` وPyTorch، وهما غير ضمن تثبيت الأساس. راجع توافق NeMo/PyTorch مع إصدار Python ومعمارية ARM64 في بيئتك أولًا. لا يوجد أمر تثبيت واحد مضمون لكل صور Debian على Android. بعد تهيئة بيئة متوافقة وتثبيت NeMo:
+### NeMo ASR
+
+بعد التأكد من وجود بيئة متوافقة ومساحة كافية، يجب تثبيت PyTorch و`nemo_toolkit[asr]` وفق تعليمات وإصدارات تدعم جهازك. لا يوجد أمر pip عام مضمون لـAndroid/Termux ARM64/Python الحالي. عند التثبيت:
 
 ```bash
-mega-transcribe transcribe recording.wav --model models/AudioModels/asr-egyptian-nemo-v2.0/asr-egyptian-nemo-v2.0.nemo --language ar --output-dir outputs
+mega-transcribe transcribe "$HOME/storage/shared/Recording.amr" \
+  --model "$MEGA_NEMO_MODEL" --language ar --output-dir outputs
 ```
 
-يقوم البرنامج بتحميل ملف `.nemo` محليًا عبر `restore_from` ويحاول إبقاء inference على CPU. لا يطلب ملفات من الإنترنت. إن احتاج النموذج tokenizer/ملفات خارجية أو تعذر تحميله بسبب توافق Torch/NeMo، تظهر رسالة الخطأ دون تنزيل تلقائي.
+إن فشل تثبيت Torch/NeMo، فإن بديلًا واقعيًا هو تشغيل backend على Linux/PC متوافق ونقل الصوت إليه؛ لا تدّع أن نموذج `.nemo` يعمل لمجرد وجود الملف.
 
-## مساعد Qwen (اختياري)
+### Qwen code assistant
 
-ثبّت llama.cpp Python binding بعد التأكد من المساحة وأدوات البناء المتاحة؛ بناء `llama-cpp-python` على ARM64 قد يكون ثقيلًا. إن كان مثبتًا:
+الخيار الأصلي Python `llama-cpp-python` يحتاج بناء native وقد يفشل/يستهلك مساحة كبيرة. خيار Termux البديل هو بناء llama.cpp اختياريًا:
 
 ```bash
-mega-transcribe assistant --model /مسار/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf
-mega-transcribe assistant --prompt "اشرح الخطأ واقترح تصحيحًا" --model /مسار/qwen.gguf
+pkg install clang cmake make git
+bash build-llama-termux.sh
 ```
 
-المساعد لا ينفذ شيفرات أو أوامر، ولا يكتب تغييرات على المشروع. راجع اقتراحاته وشغّل الاختبارات بنفسك. ملف Qwen لم يظهر في الصور، لذلك يجب توفير مساره إن كان موجودًا.
+بعدها يتوفر `llama-server`؛ هذه النسخة تكتشف/تعرض ملف GGUF، لكن endpoint الحوار المباشر حاليًا يستخدم `llama-cpp-python`، لذا ثبّت binding المتوافق فقط إذا كان متاحًا على جهازك. لا تُنشئ محاولة بناء كبيرة مع أقل من مساحة حرة مناسبة. مساعد Qwen لا ينفذ الأوامر ولا يكت�� تغييرات.
 
-## صيغ النتائج
+## المخرجات والقيود
 
-ينشئ التفريغ ملفي UTF-8: نصًا `.txt` وبيانات `.json` في مجلد النتائج. لا ننشئ SRT زائفًا: واجهة NeMo العامة قد تعيد النص فقط دون طوابع زمنية، ولا تُستنتج الطوابع الزمنية من النص.
+لكل صوت `name.txt`, `name.srt`, و`name.json`. SRT ليس مضمونًا حرفيًا أو متزامنًا على مستوى كل كلمة إذا لم يخرج النموذج بيانات توقيت؛ يوضح JSON مصدر التوقيت. الدقة تتأثر بجودة الميكروفون، الضوضاء، الضغط، اللهجة، التداخل وسعة الجهاز. يجب مراجعة التفريغ يدويًا، لا سيما إذا كان للاستخدام الرسمي أو ديني/إذاعي.
 
-```bash
-mega-transcribe transcribe recording.wav --model /path/to/model.nemo --output-dir outputs --language ar
-```
-
-## حدود التنفيذ الحالية
-
-- نموذج NeMo هو backend ASR الوحيد المفعّل؛ ملفات ONNX وCTC وPyannote وMossFormer تظهر في التشخيص، لكن لا يتم الادعاء بأنها مدمجة قبل معرفة واجهة/إعدادات نسختها.
-- لا يوجد تسجيل صوتي حي أو واجهة رسومية أو تنزيل نماذج.
-- لا يمكن التحقق عن بعد من ملفات الهاتف. نتائج التشغيل تعتمد على إتاحة الملفات والموارد وتوافق الحزم داخل Horus.
+الواجهة تعرض النماذج التي وجدتها، لكنها لا تشغل VAD/pyannote/MossFormer/deepfilter/CTC تلقائيًا دون backend مُطابق ومختبر. لا تضبط sliders وهمية أو نسب فصل لا تتحكم في نموذج فعلي.

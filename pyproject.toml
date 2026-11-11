@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mega-transcribe-offline"
+version = "0.1.0"
+description = "Offline Arabic audio transcription and local coding assistant for Horus/Debian."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+assistant = ["llama-cpp-python>=0.3,<1"]
+vad = ["onnxruntime>=1.17"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+mega-transcribe = "mega_transcribe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

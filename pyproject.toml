@@ -22,5 +22,8 @@ mega-transcribe-web = "mega_transcribe.web_app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+mega_transcribe = ["web/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

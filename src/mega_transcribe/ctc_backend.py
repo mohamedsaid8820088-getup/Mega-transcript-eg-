@@ -9,12 +9,18 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SAMPLE_RATE = 16_000
 FRAME_SECONDS = 0.020
 CHUNK_SECONDS = 20
 OVERLAP_SECONDS = 1
+Progress = Callable[[int, str, str], None]
+
+
+def _report(progress: Progress | None, percent: int, stage: str, message: str) -> None:
+    if progress:
+        progress(percent, stage, message)
 
 
 def _find_asset(env_name: str, models_dir: Path, filename: str) -> Path:
@@ -84,7 +90,7 @@ def _decode_ids(ids: list[int], tokens: dict[int, str]) -> tuple[str, list[tuple
     return "".join(text_parts).strip(), words
 
 
-def _read_audio(path: Path) -> Any:
+def _read_audio(path: Path, progress: Progress | None = None) -> Any:
     try:
         import numpy as np
     except ImportError as exc:
@@ -92,6 +98,7 @@ def _read_audio(path: Path) -> Any:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("FFmpeg غير مثبت. في Termux نفّذ: pkg install ffmpeg")
+    _report(progress, 10, "prepare", "تحويل الصوت إلى PCM أحادي 16 kHz")
     with tempfile.TemporaryDirectory(prefix="mega-ctc-") as temp:
         pcm = Path(temp) / "audio.wav"
         command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", str(pcm)]
@@ -109,18 +116,22 @@ def _read_audio(path: Path) -> Any:
     if audio.size == 0:
         raise ValueError("ملف الصوت فارغ أو لا يحتوي عينات صوتية.")
     audio = (audio - float(audio.mean())) / max(float(audio.std()), 1e-7)
+    _report(progress, 25, "prepare", "اكتمل تجهيز نسخة مؤقتة؛ الأصل لم يتغير")
     return audio
 
 
-def _infer(audio: Any, model_path: Path) -> tuple[Any, dict[str, Any]]:
+def _infer(audio: Any, model_path: Path, *, threads: int = 2, progress: Progress | None = None) -> tuple[Any, dict[str, Any]]:
     try:
         import numpy as np
         import onnxruntime as ort
     except ImportError as exc:
         raise RuntimeError("ONNX Runtime/NumPy غير متاحين. في Termux: pkg install python-onnxruntime python-numpy") from exc
+    if not 1 <= threads <= 4:
+        raise ValueError("عدد خيوط CPU يجب أن يكون بين 1 و4 للمحافظة على استقرار الجهاز.")
     options = ort.SessionOptions()
-    options.intra_op_num_threads = max(1, int(os.environ.get("MEGA_CTC_THREADS", "2")))
+    options.intra_op_num_threads = threads
     options.inter_op_num_threads = 1
+    _report(progress, 35, "load_model", "تحميل نموذج CTC على CPU")
     try:
         session = ort.InferenceSession(str(model_path), sess_options=options, providers=["CPUExecutionProvider"])
     except Exception as exc:
@@ -134,11 +145,14 @@ def _infer(audio: Any, model_path: Path) -> tuple[Any, dict[str, Any]]:
     chunk = CHUNK_SECONDS * SAMPLE_RATE
     overlap = OVERLAP_SECONDS * SAMPLE_RATE
     if audio.size <= chunk:
+        _report(progress, 55, "inference", "تشغيل الاستدلال على المقطع")
         logits = session.run(["logits"], {"audio": audio[None, :].astype(np.float32)})[0][0]
-        return logits, {"chunked": False}
+        _report(progress, 82, "inference", "اكتمل استدلال النموذج")
+        return logits, {"chunked": False, "cpu_threads": threads}
     pieces = []
     stride = chunk - overlap
     starts = list(range(0, audio.size, stride))
+    total = len(starts)
     for number, start in enumerate(starts):
         end = min(start + chunk, audio.size)
         sample = audio[start:end]
@@ -147,10 +161,11 @@ def _infer(audio: Any, model_path: Path) -> tuple[Any, dict[str, Any]]:
         right = len(logits) if end == audio.size else len(logits) - int(round((overlap / 2) / (SAMPLE_RATE * FRAME_SECONDS)))
         if right > left:
             pieces.append(logits[left:right])
-    return np.concatenate(pieces, axis=0), {"chunked": True, "chunk_seconds": CHUNK_SECONDS, "overlap_seconds": OVERLAP_SECONDS}
+        _report(progress, 55 + int(27 * (number + 1) / total), "inference", f"معالجة مقطع {number + 1} من {total}")
+    return np.concatenate(pieces, axis=0), {"chunked": True, "chunk_seconds": CHUNK_SECONDS, "overlap_seconds": OVERLAP_SECONDS, "cpu_threads": threads}
 
 
-def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | None = None, vocab_path: Path | None = None, formats: tuple[str, ...] = ("txt", "srt", "json")) -> list[Path]:
+def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | None = None, vocab_path: Path | None = None, formats: tuple[str, ...] = ("txt", "srt", "json"), threads: int = 2, progress: Progress | None = None) -> list[Path]:
     audio_path = audio_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     if not audio_path.is_file():
@@ -158,6 +173,8 @@ def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | Non
     allowed = {"txt", "srt", "json"}
     if not formats or set(formats) - allowed:
         raise ValueError("الصيغ المتاحة: txt وsrt وjson")
+    if not 1 <= threads <= 4:
+        raise ValueError("عدد خيوط CPU يجب أن يكون بين 1 و4.")
     if model_path is None or vocab_path is None:
         default_model, default_vocab = default_assets()
         model_path = model_path or default_model
@@ -169,9 +186,10 @@ def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | Non
     if tokens.get(0) not in {"<pad>", "[PAD]"}:
         raise ValueError("القاموس غير متوافق: فئة CTC blank المتوقعة ذات المعرف 0.")
     if not all(index in tokens for index in range(43)):
-        raise ValueError("القاموس لا ��حتوي جميع فئات خرج النموذج (0–42).")
-    audio = _read_audio(audio_path)
-    logits, chunk_info = _infer(audio, model_path)
+        raise ValueError("الق��موس لا يحتوي جميع فئات خرج النموذج (0–42).")
+    audio = _read_audio(audio_path, progress)
+    logits, chunk_info = _infer(audio, model_path, threads=threads, progress=progress)
+    _report(progress, 88, "decode", "فك رموز CTC وبناء التوقيتات التقريبية")
     ids = logits.argmax(axis=-1).tolist()
     text, words = _decode_ids(ids, tokens)
     try:
@@ -186,6 +204,7 @@ def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | Non
     output_dir.mkdir(parents=True, exist_ok=True)
     result: list[Path] = []
     stem = audio_path.stem
+    _report(progress, 94, "save", "حفظ ملفات التفريغ")
     if "txt" in formats:
         target = output_dir / f"{stem}.txt"
         target.write_text(text + "\n", encoding="utf-8")
@@ -200,6 +219,7 @@ def transcribe_ctc(audio_path: Path, output_dir: Path, *, model_path: Path | Non
         payload = {"audio": str(audio_path), "model": str(model_path), "vocabulary": str(vocab_path), "language": "Egyptian Arabic", "text": text, "segments": [{"start": start, "end": end, "text": word} for start, end, word in words], "timestamp_precision": "CTC frame-derived word intervals (20 ms frames); review recommended", "mean_max_probability": confidence, "blank_frame_ratio": blank_ratio, "inference": chunk_info, "warning": "Greedy CTC confidence cannot reliably distinguish speech from noise. Review low-quality/noisy clips; enhancement cannot recover information absent from the recording."}
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         result.append(target)
+    _report(progress, 98, "save", "حُفظت المخرجات")
     return result
 
 
@@ -209,10 +229,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--vocab", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--threads", type=int, default=2, choices=range(1, 5))
     parser.add_argument("--formats", nargs="+", choices=("txt", "srt", "json"), default=("txt", "srt", "json"))
     args = parser.parse_args(argv)
     try:
-        for path in transcribe_ctc(args.audio, args.output_dir, model_path=args.model, vocab_path=args.vocab, formats=tuple(args.formats)):
+        for path in transcribe_ctc(args.audio, args.output_dir, model_path=args.model, vocab_path=args.vocab, formats=tuple(args.formats), threads=args.threads):
             print(f"حُفظ: {path}")
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         parser.exit(1, f"خطأ: {exc}\n")

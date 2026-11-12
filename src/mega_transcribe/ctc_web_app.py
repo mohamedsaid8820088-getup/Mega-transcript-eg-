@@ -1,4 +1,4 @@
-"""Minimal loopback-only browser UI for local ONNX CTC transcription."""
+"""Loopback-only local web UI for ONNX CTC transcription and model status."""
 from __future__ import annotations
 
 import json
@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .ctc_backend import default_assets, transcribe_ctc
+from .model_inventory import inventory
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = Path(os.environ.get("MEGA_MODELS_DIR", str(ROOT / "models" / "AudioModels"))).expanduser()
@@ -22,25 +23,35 @@ UPLOAD_DIR = OUTPUT_DIR / ".uploads"
 MAX_UPLOAD = 48 * 1024 * 1024
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
-WORK: queue.Queue[tuple[str, Path, tuple[str, ...]]] = queue.Queue(maxsize=2)
+WORK: queue.Queue[tuple[str, Path, tuple[str, ...], int]] = queue.Queue(maxsize=2)
 ALLOWED = {".wav", ".mp3", ".m4a", ".aac", ".amr", ".ogg", ".opus", ".flac", ".3gp", ".mp4", ".webm"}
+
+
+def _update_progress(job_id: str, percent: int, stage: str, message: str) -> None:
+    with LOCK:
+        job = JOBS.get(job_id)
+        if job:
+            job.update(progress=max(0, min(99, int(percent))), stage=stage, message=message)
 
 
 def _worker() -> None:
     while True:
-        job_id, audio, formats = WORK.get()
+        job_id, audio, formats, threads = WORK.get()
         try:
+            _update_progress(job_id, 5, "prepare", "بدأت المعالجة المحلية")
+            outputs = transcribe_ctc(audio, OUTPUT_DIR, formats=formats, threads=threads, progress=lambda p, s, m: _update_progress(job_id, p, s, m))
             with LOCK:
-                JOBS[job_id].update(status="processing", message="جارٍ تشغيل نموذج CTC محليًا…")
-            outputs = transcribe_ctc(audio, OUTPUT_DIR, formats=formats)
-            with LOCK:
-                JOBS[job_id].update(status="complete", message="اكتمل التفريغ. راجع النص خصوصًا في المقاطع المشوشة.", outputs=[{"name": p.name, "url": f"/outputs/{p.name}"} for p in outputs])
+                if job_id in JOBS:
+                    JOBS[job_id].update(status="complete", progress=100, stage="complete", message="اكتمل التفريغ. راجع النص خصوصًا في المقاطع المشوشة.", outputs=[{"name": p.name, "url": f"/outputs/{p.name}"} for p in outputs])
         except Exception as exc:
             with LOCK:
                 if job_id in JOBS:
-                    JOBS[job_id].update(status="error", message=str(exc))
+                    JOBS[job_id].update(status="error", stage="error", message=str(exc))
         finally:
-            audio.unlink(missing_ok=True)
+            try:
+                audio.unlink(missing_ok=True)
+            except OSError:
+                pass
             WORK.task_done()
 
 
@@ -48,7 +59,7 @@ threading.Thread(target=_worker, daemon=True, name="mega-ctc-worker").start()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MegaTranscribeCTC/1.0"
+    server_version = "MegaTranscribeCTC/1.1"
     sys_version = ""
 
     def _send(self, status: int, data: bytes, content_type: str) -> None:
@@ -76,9 +87,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             try:
                 model, vocab = default_assets(MODELS_DIR)
-                self._json(200, {"ok": True, "backend": "ONNX CTC", "model": str(model), "vocab": str(vocab)})
+                self._json(200, {"ok": True, "backend": "ONNX CTC", "model": str(model), "vocab": str(vocab), "models_dir": str(MODELS_DIR)})
             except Exception as exc:
-                self._json(200, {"ok": False, "backend": "ONNX CTC", "error": str(exc)})
+                self._json(200, {"ok": False, "backend": "ONNX CTC", "error": str(exc), "models_dir": str(MODELS_DIR)})
+        elif path == "/api/models":
+            try:
+                self._json(200, inventory(MODELS_DIR))
+            except OSError as exc:
+                self._json(500, {"error": str(exc), "models": []})
         elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}", path):
             with LOCK:
                 job = JOBS.get(path.rsplit("/", 1)[-1])
@@ -124,23 +140,35 @@ class Handler(BaseHTTPRequestHandler):
                     filename = Path(part.get_filename() or "audio").name
                     audio_data = part.get_payload(decode=True)
                 elif field:
-                    fields[str(field)] = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+                    fields[str(field)] = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")[:200]
         if not audio_data or Path(filename).suffix.lower() not in ALLOWED:
-            self._json(400, {"error": "اختر ملف صوت مدعومًا مثل WAV أو MP3 أو M4A أو AMR أو FLAC"})
+            self._json(400, {"error": "اختر ملفًا صوتيًا مدعومًا مثل WAV أو MP3 أو M4A أو AMR أو FLAC"})
             return
         formats = tuple(dict.fromkeys(x for x in fields.get("formats", "txt,srt,json").split(",") if x in {"txt", "srt", "json"}))
         if not formats:
             self._json(400, {"error": "اختر صيغة إخراج واحدة على الأقل"})
             return
+        try:
+            threads = int(fields.get("threads", "2"))
+        except ValueError:
+            self._json(400, {"error": "قيمة خيوط CPU غير صالحة"})
+            return
+        if not 1 <= threads <= 4:
+            self._json(400, {"error": "اختر من 1 إلى 4 خيوط CPU"})
+            return
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)[:80] or "audio.wav"
         audio = UPLOAD_DIR / f"{uuid.uuid4().hex}_{safe}"
-        audio.write_bytes(audio_data)
+        try:
+            audio.write_bytes(audio_data)
+        except OSError as exc:
+            self._json(500, {"error": f"تعذر حفظ الرفع المؤقت: {exc}"})
+            return
         job_id = uuid.uuid4().hex
         with LOCK:
-            JOBS[job_id] = {"id": job_id, "status": "queued", "message": "في انتظار معالجة الصوت", "outputs": []}
+            JOBS[job_id] = {"id": job_id, "status": "queued", "progress": 0, "stage": "queued", "message": "في انتظار المعالجة المحلية", "outputs": [], "settings": {"cpu_threads": threads, "formats": list(formats)}}
         try:
-            WORK.put_nowait((job_id, audio, formats))
+            WORK.put_nowait((job_id, audio, formats, threads))
         except queue.Full:
             audio.unlink(missing_ok=True)
             with LOCK:
@@ -157,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
-        parser.error("ا��واجهة تقبل اتصالات الجهاز المحلي فقط.")
+        parser.error("الواجهة تقبل اتصالات الجهاز المحلي فقط.")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"واجهة التفريغ المحلية: http://{args.host}:{args.port}")

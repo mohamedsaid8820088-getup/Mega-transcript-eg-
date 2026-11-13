@@ -16,7 +16,7 @@ from urllib.parse import unquote, urlparse
 from .cli import DEFAULT_MODELS_DIR, _default_nemo, _default_qwen
 from .termux_pipeline import transcribe
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("MEGA_PROJECT_DIR", str(Path(__file__).resolve().parents[2]))).expanduser().resolve()
 MODELS_DIR = Path(os.environ.get("MEGA_MODELS_DIR", str(DEFAULT_MODELS_DIR))).expanduser()
 OUTPUT_DIR = Path(os.environ.get("MEGA_OUTPUT_DIR", str(ROOT / "outputs"))).expanduser()
 UPLOAD_DIR = OUTPUT_DIR / ".uploads"
@@ -24,20 +24,20 @@ MAX_UPLOAD = 48 * 1024 * 1024
 MAX_JOBS = 40
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
-WORK: queue.Queue[tuple[str, Path, str | None, str, tuple[str, ...]]] = queue.Queue(maxsize=3)
+WORK: queue.Queue[tuple[str, Path, str | None, str, tuple[str, ...], float, float]] = queue.Queue(maxsize=2)
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".amr", ".ogg", ".opus", ".flac", ".3gp", ".mp4", ".webm"}
 
 
 def _worker() -> None:
     while True:
-        job_id, audio_path, language, profile, formats = WORK.get()
+        job_id, audio_path, language, profile, formats, denoise, gain_db = WORK.get()
         try:
             with LOCK:
                 JOBS[job_id].update(status="processing", message="Preparing temporary PCM and running local NeMo ASR.")
             model_path = _default_nemo(MODELS_DIR)
-            outputs = transcribe(audio_path, model_path, OUTPUT_DIR, language=language, profile=profile, formats=formats)
+            outputs = transcribe(audio_path, model_path, OUTPUT_DIR, language=language, profile=profile, formats=formats, denoise_strength=denoise, gain_db=gain_db)
             with LOCK:
-                JOBS[job_id].update(status="complete", message="Completed. Check timing precision in JSON.", outputs=[{"name": p.name, "url": f"/outputs/{p.name}"} for p in outputs])
+                JOBS[job_id].update(status="complete", message="Completed. Check JSON for actual timestamp precision.", outputs=[{"name": p.name, "url": f"/outputs/{p.name}"} for p in outputs])
         except Exception as exc:
             with LOCK:
                 if job_id in JOBS:
@@ -54,7 +54,7 @@ threading.Thread(target=_worker, daemon=True, name="mega-audio-worker").start()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MegaTranscribe/0.3"
+    server_version = "MegaTranscribe/0.4"
     sys_version = ""
 
     def _send(self, status: int, data: bytes, content_type: str) -> None:
@@ -72,10 +72,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _local_origin(self) -> bool:
         origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        host = urlparse(origin).hostname
-        return host in {"127.0.0.1", "localhost", "::1"}
+        return not origin or urlparse(origin).hostname in {"127.0.0.1", "localhost", "::1"}
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -97,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
                         if len(models) >= 300:
                             break
             qwen = _default_qwen()
-            self._json(200, {"models": models, "qwen": str(qwen) if qwen.is_file() else None, "notice": "Other model artifacts are inventoried only; their matching runtimes are not enabled in this build."})
+            self._json(200, {"models": models, "qwen": str(qwen) if qwen.is_file() else None, "notice": "Non-NeMo assets are inventoried only until their matching inference backend is configured."})
         elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}", parsed.path):
             job_id = parsed.path.rsplit("/", 1)[-1]
             with LOCK:
@@ -151,10 +148,15 @@ class Handler(BaseHTTPRequestHandler):
                 fields[str(field)] = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")[:200]
         if not file_bytes or Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
             self._json(400, {"error": "choose supported audio: WAV, MP3, M4A, AMR, OGG, FLAC, 3GP, etc."}); return
+        path: Path | None = None
         try:
             profile = fields.get("profile", "faithful")
             if profile not in {"faithful", "speech"}:
                 raise ValueError("invalid preprocessing profile")
+            denoise = float(fields.get("denoise", "0"))
+            gain_db = float(fields.get("gain_db", "0"))
+            if not 0 <= denoise <= 1 or not -12 <= gain_db <= 12:
+                raise ValueError("denoise must be 0..1 and gain must be -12..12 dB")
             requested = fields.get("formats", "txt,srt,json")
             formats = tuple(dict.fromkeys(x for x in requested.split(",") if x in {"txt", "srt", "json"}))
             if not formats:
@@ -172,12 +174,15 @@ class Handler(BaseHTTPRequestHandler):
                             del JOBS[old_id]
                             if len(JOBS) < MAX_JOBS:
                                 break
-                JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Waiting for the local worker", "outputs": []}
-            WORK.put_nowait((job_id, path, language, profile, formats))
+                JOBS[job_id] = {"id": job_id, "status": "queued", "message": "Waiting for local worker", "outputs": []}
+            WORK.put_nowait((job_id, path, language, profile, formats, denoise, gain_db))
         except queue.Full:
-            path.unlink(missing_ok=True)
+            if path:
+                path.unlink(missing_ok=True)
             self._json(503, {"error": "processing queue is full; wait for the current job"}); return
         except (OSError, ValueError) as exc:
+            if path:
+                path.unlink(missing_ok=True)
             self._json(400, {"error": str(exc)}); return
         self._json(202, {"id": job_id, "status": "queued"})
 

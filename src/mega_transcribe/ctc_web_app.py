@@ -1,4 +1,4 @@
-"""Loopback-only local web UI for CTC and optional NeMo transcription."""
+"""Loopback-only local web UI for CTC, optional NeMo, and Pyannote raw segmentation."""
 from __future__ import annotations
 
 import json
@@ -17,6 +17,7 @@ from urllib.parse import quote, unquote, urlparse
 from .cli import _default_nemo
 from .ctc_backend import default_assets, transcribe_ctc
 from .model_inventory import inventory
+from .pyannote_onnx import analyze_segmentation, default_segmentation_path
 from .termux_pipeline import transcribe as transcribe_nemo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,41 +42,46 @@ def _worker() -> None:
         job_id, audio, formats, threads, engines, profile = WORK.get()
         engine_results: list[dict] = []
         all_outputs: list[dict] = []
-        engine_errors: list[str] = []
+        errors: list[str] = []
         try:
             for index, engine in enumerate(engines):
                 base = 5 + int(90 * index / len(engines))
-                _update(job_id, status="processing", progress=base, stage="prepare", message=f"بدء محرك {engine.upper()} ({index + 1}/{len(engines)})")
-                # Give each backend a distinct basename so same-format outputs never overwrite each other.
+                _update(job_id, status="processing", progress=base, stage="prepare", message=f"بدء {engine} ({index + 1}/{len(engines)})")
                 engine_audio = UPLOAD_DIR / f"{job_id}_{engine}_{audio.name}"
-                shutil.copyfile(audio, engine_audio)
                 try:
-                    if engine == "ctc":
-                        def progress(percent: int, stage: str, message: str) -> None:
+                    if engine == "pyannote":
+                        model = default_segmentation_path(MODELS_DIR)
+                        destination = OUTPUT_DIR / f"{audio.stem}_{job_id}_pyannote-segmentation.json"
+                        def report(percent: int, message: str) -> None:
                             overall = base + int((90 / len(engines)) * percent / 100)
-                            _update(job_id, progress=min(98, overall), stage=stage, message=f"CTC: {message}")
-                        outputs = transcribe_ctc(engine_audio, OUTPUT_DIR, formats=formats, threads=threads, progress=progress)
+                            _update(job_id, progress=min(98, overall), stage="inference", message=f"Pyannote: {message}")
+                        outputs = [analyze_segmentation(audio, model, destination, threads=threads, progress=report)]
                     else:
-                        model = _default_nemo(MODELS_DIR)
-                        if not model.is_file():
-                            raise FileNotFoundError(f"لم يُعثر على نموذج NeMo .nemo. اضبط MEGA_NEMO_MODEL؛ المسار المتوقع: {model}")
-                        _update(job_id, progress=base + 5, stage="load_model", message="NeMo: تحميل النموذج المحلي على CPU؛ قد تستغرق هذه المرحلة وقتًا")
-                        outputs = transcribe_nemo(engine_audio, model, OUTPUT_DIR, language="ar", profile=profile, formats=formats)
+                        shutil.copyfile(audio, engine_audio)
+                        if engine == "ctc":
+                            def report_ctc(percent: int, stage: str, message: str) -> None:
+                                overall = base + int((90 / len(engines)) * percent / 100)
+                                _update(job_id, progress=min(98, overall), stage=stage, message=f"CTC: {message}")
+                            outputs = transcribe_ctc(engine_audio, OUTPUT_DIR, formats=formats, threads=threads, progress=report_ctc)
+                        else:
+                            model = _default_nemo(MODELS_DIR)
+                            if not model.is_file():
+                                raise FileNotFoundError(f"لم يُعثر على نموذج NeMo .nemo: {model}")
+                            _update(job_id, progress=base + 5, stage="load_model", message="NeMo: تحميل النموذج المحلي على CPU")
+                            outputs = transcribe_nemo(engine_audio, model, OUTPUT_DIR, language="ar", profile=profile, formats=formats)
                     entries = [{"engine": engine, "name": p.name, "url": f"/outputs/{quote(p.name)}"} for p in outputs]
                     all_outputs.extend(entries)
                     engine_results.append({"engine": engine, "status": "complete", "outputs": entries})
                 except Exception as exc:
-                    engine_errors.append(f"{engine.upper()}: {exc}")
+                    errors.append(f"{engine}: {exc}")
                     engine_results.append({"engine": engine, "status": "error", "error": str(exc)})
                 finally:
                     engine_audio.unlink(missing_ok=True)
             if all_outputs:
-                message = "اكتمل التفريغ." if not engine_errors else "اكتمل أحد المحركات على الأقل؛ تعذر تشغيل محرك آخر. راجع تفاصيل النتيجة."
-                if engine_errors:
-                    message += "\n" + "\n".join(engine_errors)
+                message = "اكتملت المعالجة المحلية." + (("\n" + "\n".join(errors)) if errors else "")
                 _update(job_id, status="complete", progress=100, stage="complete", message=message, outputs=all_outputs, engines=engine_results)
             else:
-                _update(job_id, status="error", stage="error", message="فشلت كل المحركات المحددة. " + "\n".join(engine_errors), engines=engine_results)
+                _update(job_id, status="error", stage="error", message="فشلت كل المحركات المحددة. " + "\n".join(errors), engines=engine_results)
         except Exception as exc:
             _update(job_id, status="error", stage="error", message=str(exc), engines=engine_results)
         finally:
@@ -87,7 +93,7 @@ threading.Thread(target=_worker, daemon=True, name="mega-asr-worker").start()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MegaTranscribeLocal/1.2"
+    server_version = "MegaTranscribeLocal/1.3"
     sys_version = ""
 
     def _send(self, status: int, data: bytes, content_type: str) -> None:
@@ -110,8 +116,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/":
-            page = Path(__file__).with_name("web").joinpath("ctc.html")
-            self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+            self._send(200, Path(__file__).with_name("web").joinpath("ctc.html").read_bytes(), "text/html; charset=utf-8")
         elif path == "/api/health":
             try:
                 model, vocab = default_assets(MODELS_DIR)
@@ -122,12 +127,16 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import torch  # noqa: F401
                 from nemo.collections.asr.models import ASRModel  # noqa: F401
-                nemo_runtime = True
-                nemo_error = None
+                nemo_runtime, nemo_error = True, None
             except Exception as exc:
-                nemo_runtime = False
-                nemo_error = f"{type(exc).__name__}: {exc}"
-            self._json(200, {"ok": ctc_ok, "backend": "CTC ONNX + NeMo (اختياري)", "model": str(model) if model else None, "vocab": str(vocab) if vocab else None, "ctc_error": ctc_error, "models_dir": str(MODELS_DIR), "nemo_model": str(nemo), "nemo_found": nemo.is_file(), "nemo_runtime": nemo_runtime, "nemo_error": nemo_error})
+                nemo_runtime, nemo_error = False, f"{type(exc).__name__}: {exc}"
+            segmentation = default_segmentation_path(MODELS_DIR)
+            try:
+                import onnxruntime  # noqa: F401
+                onnx_available = True
+            except Exception:
+                onnx_available = False
+            self._json(200, {"ok": ctc_ok, "model": str(model) if model else None, "vocab": str(vocab) if vocab else None, "ctc_error": ctc_error, "models_dir": str(MODELS_DIR), "nemo_model": str(nemo), "nemo_found": nemo.is_file(), "nemo_runtime": nemo_runtime, "nemo_error": nemo_error, "pyannote_segmentation": str(segmentation), "pyannote_found": segmentation.is_file(), "onnx_runtime_available": onnx_available})
         elif path == "/api/models":
             self._json(200, inventory(MODELS_DIR))
         elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}", path):
@@ -183,9 +192,9 @@ class Handler(BaseHTTPRequestHandler):
         if not formats:
             self._json(400, {"error": "اختر صيغة إخراج واحدة على الأقل"})
             return
-        engines = tuple(dict.fromkeys(x for x in fields.get("engines", "ctc").split(",") if x in {"ctc", "nemo"}))
+        engines = tuple(dict.fromkeys(x for x in fields.get("engines", "ctc").split(",") if x in {"ctc", "nemo", "pyannote"}))
         if not engines:
-            self._json(400, {"error": "اختر محرك تفريغ واحدًا على الأقل"})
+            self._json(400, {"error": "اختر محركًا أو أداة واحدة على الأقل"})
             return
         try:
             threads = int(fields.get("threads", "2"))
@@ -197,15 +206,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         profile = fields.get("profile", "faithful")
         if profile not in {"faithful", "speech"}:
-            self._json(400, {"error": "معالجة الصوت غير صالحة"})
+            self._json(400, {"error": "إعداد معالجة الصوت غير صالح"})
             return
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)[:80] or "audio.wav"
         audio = UPLOAD_DIR / f"{uuid.uuid4().hex}_{safe}"
-        audio.write_bytes(audio_data)
+        try:
+            audio.write_bytes(audio_data)
+        except OSError as exc:
+            self._json(500, {"error": f"تعذر حفظ الرفع المؤقت: {exc}"})
+            return
         job_id = uuid.uuid4().hex
         with LOCK:
-            JOBS[job_id] = {"id": job_id, "status": "queued", "progress": 0, "stage": "queued", "message": "في انتظار المعالجة المحلية", "outputs": [], "engines": [], "settings": {"cpu_threads": threads, "engines": list(engines), "formats": list(formats), "profile": profile}}
+            JOBS[job_id] = {"id": job_id, "status": "queued", "progress": 0, "stage": "queued", "message": "في انتظار المعالجة المحلية", "outputs": [], "engines": [], "settings": {"threads": threads, "engines": list(engines), "formats": list(formats), "profile": profile}}
         try:
             WORK.put_nowait((job_id, audio, formats, threads, engines, profile))
         except queue.Full:
@@ -219,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    parser = argparse.ArgumentParser(description="واجهة التفريغ المحلية CTC وNeMo الاختيارية")
+    parser = argparse.ArgumentParser(description="واجهة محلية لـ CTC وPyannote segmentation وNeMo الاختياري")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
